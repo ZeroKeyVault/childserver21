@@ -1,236 +1,318 @@
-// server.js - WebSocket relay server for Child messaging app
-// Deploy on Render as a Web Service
-// Start command: node server.js
+// server2.js
+// Persistent WebSocket relay + PreKey registry for simplified X3DH + file chunk relay
+//
+// Usage: node server2.js
+// Requires: npm i express ws body-parser
+//
+// Security note: Server only stores encrypted blobs and key metadata (prekeys). It does not
+// attempt to decrypt messages. The server persists DB to disk (db.json). For production,
+// use a proper DB and rotate encryption keys at rest.
 
-const WebSocket = require('ws');
+const fs = require('fs');
+const path = require('path');
 const http = require('http');
-const crypto = require('crypto');
+const express = require('express');
+const bodyParser = require('body-parser');
+const WebSocket = require('ws');
 
+const DB_PATH = path.join(__dirname, 'db.json');
 const PORT = process.env.PORT || 8080;
 
-// In-memory message queue: userId -> [{vaultId, blob, id, from, ts}]
-const messageQueue = new Map();
-// Active connections: userId -> WebSocket
-const connections = new Map();
-// Vault membership tracking: vaultId -> Set of userIds
-const vaultMembers = new Map();
+// Load or initialize DB
+let DB = {
+  users: {},          // userId -> { identityPub (base64url), signPub (base64url), lastSeen }
+  prekeys: {},        // userId -> { prekeys: [pub1, pub2...], oneTimePrekeys: [pub...] }
+  vaults: {},         // vaultId -> { creator, members: Set([...]), createdAt }
+  queues: {},         // userId -> [ message objects ... ]
+  messagesRetentionMs: 7 * 24 * 60 * 60 * 1000
+};
 
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Child relay server running');
+function loadDB() {
+  try {
+    if (fs.existsSync(DB_PATH)) {
+      const raw = fs.readFileSync(DB_PATH, 'utf8');
+      DB = JSON.parse(raw);
+      // convert members arrays back to sets if needed
+      for (const v of Object.values(DB.vaults)) {
+        if (Array.isArray(v.members)) v.members = new Set(v.members);
+        else if (!v.members) v.members = new Set();
+      }
+      console.log('DB loaded');
+    } else {
+      persistDB();
+    }
+  } catch (e) {
+    console.error('Failed to load DB:', e);
+  }
+}
+
+function persistDB() {
+  // convert Sets to arrays for JSON
+  const copy = JSON.parse(JSON.stringify(DB, (k, v) => {
+    if (v instanceof Set) return Array.from(v);
+    return v;
+  }));
+  fs.writeFileSync(DB_PATH, JSON.stringify(copy, null, 2), 'utf8');
+}
+
+// periodic DB persist
+setInterval(() => persistDB(), 5000);
+
+loadDB();
+
+const app = express();
+app.use(bodyParser.json({ limit: '5mb' }));
+
+// Simple health
+app.get('/', (req, res) => res.send('Child relay persistent server'));
+
+// Register or update a user's prekey bundle
+// Body: { userId, identityPub, signPub (optional), prekeys: [pub...], oneTimePrekeys: [pub...] }
+app.post('/register_prekeys', (req, res) => {
+  const body = req.body;
+  if (!body || !body.userId || !body.identityPub || !Array.isArray(body.prekeys)) {
+    return res.status(400).json({ error: 'invalid' });
+  }
+  const uid = body.userId;
+  DB.users[uid] = DB.users[uid] || {};
+  DB.users[uid].identityPub = body.identityPub;
+  if (body.signPub) DB.users[uid].signPub = body.signPub;
+  DB.users[uid].lastSeen = Date.now();
+
+  DB.prekeys[uid] = DB.prekeys[uid] || { prekeys: [], oneTimePrekeys: [] };
+
+  // Overwrite current prekeys (rotate)
+  DB.prekeys[uid].prekeys = body.prekeys.slice(0, 50); // limit to 50 stored
+  if (Array.isArray(body.oneTimePrekeys)) {
+    DB.prekeys[uid].oneTimePrekeys = body.oneTimePrekeys.slice(0, 200);
+  }
+
+  persistDB();
+
+  return res.json({ ok: true });
 });
 
+// Fetch prekey bundle for a user
+// GET /get_prekeys/:userId
+// returns { identityPub, prekeys: [...], oneTimePrekey? }
+app.get('/get_prekeys/:userId', (req, res) => {
+  const uid = req.params.userId;
+  if (!DB.prekeys[uid] || !DB.users[uid]) {
+    return res.status(404).json({ error: 'not_found' });
+  }
+  const pk = DB.prekeys[uid];
+  const one = pk.oneTimePrekeys && pk.oneTimePrekeys.length > 0 ? pk.oneTimePrekeys.shift() : null;
+  persistDB();
+  return res.json({
+    identityPub: DB.users[uid].identityPub,
+    prekeys: pk.prekeys,
+    oneTimePrekey: one || null,
+    signPub: DB.users[uid].signPub || null
+  });
+});
+
+// Fetch user metadata (for listing vault members etc.)
+app.get('/user/:userId', (req, res) => {
+  const uid = req.params.userId;
+  if (!DB.users[uid]) return res.status(404).json({ error: 'not_found' });
+  return res.json(DB.users[uid]);
+});
+
+// WebSocket server for relaying encrypted messages and handling identify/join/send/leave/nuke, file chunks, and x3dh handshake messages
+const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// Clean up old messages periodically (messages older than 7 days)
-const MESSAGE_RETENTION = 7 * 24 * 60 * 60 * 1000; // 7 days
+const connections = new Map(); // userId -> ws
+
+// helper: queue message for offline user
+function queueMessage(userId, msg) {
+  DB.queues[userId] = DB.queues[userId] || [];
+  DB.queues[userId].push(msg);
+  persistDB();
+}
+
+function deliverQueued(userId) {
+  if (!connections.has(userId)) return;
+  const ws = connections.get(userId);
+  const list = DB.queues[userId] || [];
+  for (const m of list) {
+    try {
+      ws.send(JSON.stringify(m));
+    } catch (e) {
+      console.error('deliverQueued send error', e);
+    }
+  }
+  DB.queues[userId] = [];
+  persistDB();
+}
+
+// remove old queued messages older than retention
 setInterval(() => {
   const now = Date.now();
-  for (const [userId, messages] of messageQueue.entries()) {
-    const filtered = messages.filter(m => (now - m.ts) < MESSAGE_RETENTION);
-    if (filtered.length === 0) {
-      messageQueue.delete(userId);
-    } else {
-      messageQueue.set(userId, filtered);
-    }
+  for (const uid of Object.keys(DB.queues)) {
+    DB.queues[uid] = (DB.queues[uid] || []).filter(m => {
+      if (!m.ts) return true;
+      return (now - m.ts) < DB.messagesRetentionMs;
+    });
   }
-}, 60 * 60 * 1000); // Run every hour
-
-function generateMessageId() {
-  return crypto.randomBytes(16).toString('base64url');
-}
-
-function addToQueue(userId, messageData) {
-  if (!messageQueue.has(userId)) {
-    messageQueue.set(userId, []);
-  }
-  messageQueue.get(userId).push(messageData);
-}
-
-function getAndClearQueue(userId) {
-  const messages = messageQueue.get(userId) || [];
-  messageQueue.delete(userId);
-  return messages;
-}
-
-function addVaultMember(vaultId, userId) {
-  if (!vaultMembers.has(vaultId)) {
-    vaultMembers.set(vaultId, new Set());
-  }
-  vaultMembers.get(vaultId).add(userId);
-}
-
-function removeVaultMember(vaultId, userId) {
-  if (vaultMembers.has(vaultId)) {
-    vaultMembers.get(vaultId).delete(userId);
-    if (vaultMembers.get(vaultId).size === 0) {
-      vaultMembers.delete(vaultId);
-    }
-  }
-}
-
-function getVaultMembers(vaultId) {
-  return vaultMembers.get(vaultId) || new Set();
-}
+  persistDB();
+}, 60 * 60 * 1000);
 
 wss.on('connection', (ws) => {
-  let currentUserId = null;
-  let userVaults = new Set();
+  let userId = null;
+  ws.send(JSON.stringify({ type: 'connected', ts: Date.now() }));
 
-  ws.on('message', (data) => {
+  ws.on('message', (raw) => {
     let msg;
-    try {
-      msg = JSON.parse(data.toString());
-    } catch (e) {
-      return;
-    }
+    try { msg = JSON.parse(raw); } catch (e) { return; }
 
     switch (msg.type) {
       case 'identify':
-        // User identifies with their userHash and current vaults
-        currentUserId = msg.userHash;
-        connections.set(currentUserId, ws);
-        
-        // Register user to their vaults
+        // { type:'identify', userId, vaults: [] }
+        if (!msg.userId) return;
+        userId = msg.userId;
+        connections.set(userId, ws);
+        DB.users[userId] = DB.users[userId] || { lastSeen: Date.now() };
+        DB.users[userId].lastSeen = Date.now();
+        // add to vault membership if provided
         if (Array.isArray(msg.vaults)) {
-          msg.vaults.forEach(vaultId => {
-            userVaults.add(vaultId);
-            addVaultMember(vaultId, currentUserId);
-          });
+          for (const vId of msg.vaults) {
+            DB.vaults[vId] = DB.vaults[vId] || { creator: userId, members: new Set(), createdAt: Date.now() };
+            DB.vaults[vId].members.add(userId);
+          }
+          persistDB();
         }
-
-        // Send queued messages
-        const queued = getAndClearQueue(currentUserId);
-        queued.forEach(qMsg => {
-          ws.send(JSON.stringify({
-            type: 'message',
-            vaultId: qMsg.vaultId,
-            blob: qMsg.blob,
-            from: qMsg.from,
-            id: qMsg.id,
-            ts: qMsg.ts
-          }));
-        });
-
-        ws.send(JSON.stringify({ type: 'identify-ack', userId: currentUserId }));
+        // deliver queued messages
+        deliverQueued(userId);
+        ws.send(JSON.stringify({ type: 'identify-ack', userId }));
         break;
 
       case 'join-vault':
-        // User joins a vault
-        if (!currentUserId) break;
-        const joinVaultId = msg.vaultId;
-        userVaults.add(joinVaultId);
-        addVaultMember(joinVaultId, currentUserId);
-        ws.send(JSON.stringify({ type: 'join-ack', vaultId: joinVaultId }));
-        break;
+        // { type:'join-vault', vaultId, userId }
+        if (!msg.vaultId || !msg.userId) return;
+        DB.vaults[msg.vaultId] = DB.vaults[msg.vaultId] || { creator: msg.userId, members: new Set(), createdAt: Date.now() };
+        DB.vaults[msg.vaultId].members.add(msg.userId);
+        persistDB();
 
-      case 'send':
-        // User sends encrypted message to vault
-        if (!currentUserId) break;
-        const vaultId = msg.vaultId;
-        const blob = msg.blob; // {iv, ct, fileData?}
-        const from = msg.from || currentUserId;
-        const ts = msg.ts || Date.now();
-        const msgId = generateMessageId();
-
-        const messageData = {
-          vaultId,
-          blob,
-          from,
-          id: msgId,
-          ts
-        };
-
-        // Relay to all vault members
-        const members = getVaultMembers(vaultId);
-        let delivered = false;
-
-        members.forEach(memberId => {
-          if (memberId === currentUserId) return; // Don't send to self
-          
-          const memberWs = connections.get(memberId);
-          if (memberWs && memberWs.readyState === WebSocket.OPEN) {
-            memberWs.send(JSON.stringify({
-              type: 'message',
-              vaultId,
-              blob,
-              from,
-              id: msgId,
-              ts
-            }));
-            delivered = true;
-          } else {
-            // Queue for offline user
-            addToQueue(memberId, messageData);
-          }
-        });
-
-        // Send ack to sender
-        ws.send(JSON.stringify({ type: 'send-ack', id: msgId, delivered }));
-        break;
-
-      case 'nuke':
-        // User requests complete data deletion
-        if (!currentUserId) break;
-        
-        // Clear message queue
-        messageQueue.delete(currentUserId);
-        
-        // Remove from all vaults
-        userVaults.forEach(vId => {
-          removeVaultMember(vId, currentUserId);
-        });
-        
-        // Clear connection
-        connections.delete(currentUserId);
-        
-        ws.send(JSON.stringify({ type: 'nuked' }));
-        
-        currentUserId = null;
-        userVaults.clear();
+        // notify vault creator (if online)
+        const creator = DB.vaults[msg.vaultId].creator;
+        if (creator && connections.has(creator)) {
+          connections.get(creator).send(JSON.stringify({
+            type: 'vault-join-request',
+            vaultId: msg.vaultId,
+            userId: msg.userId,
+            ts: Date.now()
+          }));
+        }
+        ws.send(JSON.stringify({ type: 'join-ack', vaultId: msg.vaultId }));
         break;
 
       case 'leave-vault':
-        if (!currentUserId) break;
-        const leaveVaultId = msg.vaultId;
-        userVaults.delete(leaveVaultId);
-        removeVaultMember(leaveVaultId, currentUserId);
-        ws.send(JSON.stringify({ type: 'leave-ack', vaultId: leaveVaultId }));
+        if (!msg.vaultId || !msg.userId) return;
+        if (DB.vaults[msg.vaultId]) {
+          DB.vaults[msg.vaultId].members.delete(msg.userId);
+          persistDB();
+        }
+        // ack
+        ws.send(JSON.stringify({ type: 'leave-ack', vaultId: msg.vaultId }));
+        break;
+
+      case 'send':
+        // Encrypted send to vault
+        // { type:'send', vaultId, from, header, blob, ts, meta }
+        if (!msg.vaultId || !msg.from) return;
+        const v = DB.vaults[msg.vaultId];
+        if (!v) {
+          // queue to creator? just ack with error
+          ws.send(JSON.stringify({ type: 'send-ack', ok: false, error: 'unknown-vault' }));
+          return;
+        }
+        const members = Array.from(v.members || []);
+        let delivered = false;
+        for (const member of members) {
+          if (member === msg.from) continue;
+          const envelope = Object.assign({}, msg, { target: member });
+          if (connections.has(member)) {
+            try {
+              connections.get(member).send(JSON.stringify(envelope));
+              delivered = true;
+            } catch (e) {
+              console.error('ws send error', e);
+              queueMessage(member, envelope);
+            }
+          } else {
+            queueMessage(member, envelope);
+          }
+        }
+        ws.send(JSON.stringify({ type: 'send-ack', ok: true, delivered }));
+        break;
+
+      case 'x3dh-init':
+      case 'x3dh-response':
+        // Relay X3DH handshake messages between users (server does not inspect keys)
+        // { type:'x3dh-init', to, from, payload }
+        if (!msg.to) return;
+        if (connections.has(msg.to)) {
+          connections.get(msg.to).send(JSON.stringify(msg));
+        } else {
+          queueMessage(msg.to, msg); // queued for offline
+        }
+        break;
+
+      case 'file-chunk':
+      case 'file-complete':
+        // File chunk relay: server only relays encrypted chunk blobs
+        // { type:'file-chunk', to, from, vaultId, chunkIndex, chunkData (base64), fileId, ts }
+        if (!msg.to) return;
+        if (connections.has(msg.to)) {
+          connections.get(msg.to).send(JSON.stringify(msg));
+        } else {
+          queueMessage(msg.to, msg);
+        }
+        break;
+
+      case 'nuke':
+        // { type:'nuke', userId }
+        if (!msg.userId) return;
+        // remove queues, vault membership
+        delete DB.queues[msg.userId];
+        for (const vId of Object.keys(DB.vaults)) {
+          DB.vaults[vId].members.delete(msg.userId);
+        }
+        persistDB();
+        ws.send(JSON.stringify({ type: 'nuked' }));
         break;
 
       case 'ping':
         ws.send(JSON.stringify({ type: 'pong', ts: Date.now() }));
         break;
+
+      default:
+        // unknown type - ignore silently
+        break;
     }
   });
 
   ws.on('close', () => {
-    if (currentUserId) {
-      connections.delete(currentUserId);
-      // Keep vault memberships - user may reconnect
+    if (userId) {
+      connections.delete(userId);
+      // We do not remove from vault membership; they can rejoin.
     }
   });
 
   ws.on('error', (err) => {
-    console.error('WebSocket error:', err);
+    console.error('ws error', err);
   });
+});
 
-  // Send initial connection ack
-  ws.send(JSON.stringify({ type: 'connected' }));
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received: persisting DB and shutting down');
+  persistDB();
+  wss.close(() => {
+    server.close(() => process.exit(0));
+  });
 });
 
 server.listen(PORT, () => {
-  console.log(`Child relay server listening on port ${PORT}`);
-  console.log(`WebSocket endpoint: ws://localhost:${PORT}`);
-});
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, closing server...');
-  wss.close(() => {
-    server.close(() => {
-      console.log('Server closed');
-      process.exit(0);
-    });
-  });
+  console.log(`Server running on port ${PORT}`);
 });
