@@ -1,336 +1,262 @@
 // ============================================================
-// CHILD v2 — SECURE ENCRYPTED MESSAGING SERVER (PERSISTENT)
-// Using SQLite (better-sqlite3) for persistent storage
-// Supports:
-//   - Private vaults (2-user only)
-//   - Public/group vaults (unlimited)
-//   - Offline message queues
-//   - Chunked encrypted file relaying
-//   - SenderKey distribution messages
-//   - No key storage (zero-knowledge server)
+// CHILD — PERSISTENT ENCRYPTED RELAY SERVER
+// Using sqlite3 (works on Node 18–25 + Render)
 // ============================================================
 
 const WebSocket = require("ws");
-const http = require("http");
-const crypto = require("crypto");
-const Database = require("better-sqlite3");
+const sqlite3 = require("sqlite3").verbose();
 const { v4: uuidv4 } = require("uuid");
 
-const PORT = process.env.PORT || 8080;
-
 // ============================================================
-// DATABASE INITIALIZATION
+// DATABASE INIT
 // ============================================================
 
-const db = new Database("child.db");
-
-// Create tables if not exist
-db.exec(`
-CREATE TABLE IF NOT EXISTS vaults (
-  id TEXT PRIMARY KEY,
-  type TEXT NOT NULL CHECK (type IN ('private','public')),
-  created_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS vault_members (
-  vault_id TEXT NOT NULL,
-  user_id  TEXT NOT NULL,
-  joined_at INTEGER NOT NULL,
-  PRIMARY KEY (vault_id, user_id)
-);
-
-CREATE TABLE IF NOT EXISTS messages (
-  id TEXT PRIMARY KEY,
-  vault_id TEXT NOT NULL,
-  sender_id TEXT NOT NULL,
-  ts INTEGER NOT NULL,
-  json TEXT NOT NULL,       -- encrypted blob
-  delivered INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS users (
-  user_id TEXT PRIMARY KEY,
-  last_seen INTEGER NOT NULL
-);
-`);
-
-// ============================================================
-// HELPER FUNCTIONS
-// ============================================================
-
-function now() {
-  return Date.now();
-}
-
-function vaultExists(vaultId) {
-  return !!db
-    .prepare("SELECT id FROM vaults WHERE id = ?")
-    .get(vaultId);
-}
-
-function getVaultType(vaultId) {
-  const row = db
-    .prepare("SELECT type FROM vaults WHERE id = ?")
-    .get(vaultId);
-  return row ? row.type : null;
-}
-
-function getVaultMemberCount(vaultId) {
-  const row = db
-    .prepare("SELECT COUNT(*) c FROM vault_members WHERE vault_id = ?")
-    .get(vaultId);
-  return row.c;
-}
-
-function addVaultIfNotExists(vaultId, type) {
-  if (!vaultExists(vaultId)) {
-    db.prepare(
-      "INSERT INTO vaults (id,type,created_at) VALUES (?,?,?)"
-    ).run(vaultId, type, now());
+const db = new sqlite3.Database("./child.db", (err) => {
+  if (err) {
+    console.error("DATABASE ERROR:", err);
+  } else {
+    console.log("[DB] Connected");
   }
-}
-
-function addUserIfNotExists(userId) {
-  db.prepare(
-    "INSERT OR IGNORE INTO users (user_id,last_seen) VALUES (?,?)"
-  ).run(userId, now());
-}
-
-function updateUserLastSeen(userId) {
-  db.prepare("UPDATE users SET last_seen = ? WHERE user_id = ?")
-    .run(now(), userId);
-}
-
-function addMemberToVault(vaultId, userId) {
-  db.prepare(
-    "INSERT OR IGNORE INTO vault_members (vault_id,user_id,joined_at) VALUES (?,?,?)"
-  ).run(vaultId, userId, now());
-}
-
-function removeMemberFromVault(vaultId, userId) {
-  db.prepare(
-    "DELETE FROM vault_members WHERE vault_id = ? AND user_id = ?"
-  ).run(vaultId, userId);
-}
-
-function getVaultMembers(vaultId) {
-  return db.prepare(
-    "SELECT user_id FROM vault_members WHERE vault_id = ?"
-  ).all(vaultId).map(r => r.user_id);
-}
-
-function queueMessage(vaultId, senderId, blob, ts) {
-  const id = uuidv4();
-  const json = JSON.stringify(blob);
-
-  db.prepare(`
-    INSERT INTO messages (id,vault_id,sender_id,ts,json,delivered)
-    VALUES (?,?,?,?,?,0)
-  `).run(id, vaultId, senderId, ts, json);
-
-  return id;
-}
-
-function getUndeliveredMessagesForUser(userId) {
-  return db.prepare(`
-    SELECT m.*
-    FROM messages m
-    JOIN vault_members v ON m.vault_id = v.vault_id
-    WHERE v.user_id = ? AND m.delivered = 0
-    ORDER BY m.ts ASC
-  `).all(userId);
-}
-
-function markMessageDelivered(id) {
-  db.prepare(
-    "UPDATE messages SET delivered = 1 WHERE id = ?"
-  ).run(id);
-}
-
-// ============================================================
-// SERVER
-// ============================================================
-
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Child relay server active");
 });
 
-const wss = new WebSocket.Server({ server });
+// Create tables
+db.serialize(() => {
+  db.run(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id TEXT PRIMARY KEY,
+      vaultId TEXT,
+      fromUser TEXT,
+      messageBlob TEXT,
+      timestamp INTEGER
+    );
+  `);
 
-// Track connected clients in memory
-const connections = new Map(); // userId -> ws
+  db.run(`
+    CREATE TABLE IF NOT EXISTS vaultMembers (
+      vaultId TEXT,
+      userId TEXT
+    );
+  `);
+});
+
+// Promisified DB helpers
+function dbRun(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function(err) {
+      if (err) reject(err);
+      else resolve(this);
+    });
+  });
+}
+
+function dbAll(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => {
+      if (err) reject(err);
+      else resolve(rows);
+    });
+  });
+}
 
 // ============================================================
-// BROADCAST/RELAY LOGIC
+// ACTIVE CLIENTS
 // ============================================================
+// userId → ws
+const clients = new Map();
 
-function deliverMessageToVaultMembers(senderId, vaultId, blob, ts) {
-  const members = getVaultMembers(vaultId);
-  const msgId = queueMessage(vaultId, senderId, blob, ts);
+// vaultId → Set of connected user ids
+const liveVaultMap = new Map();
 
-  for (const m of members) {
-    if (m === senderId) continue;
+function addToLiveVault(vaultId, userId) {
+  if (!liveVaultMap.has(vaultId)) liveVaultMap.set(vaultId, new Set());
+  liveVaultMap.get(vaultId).add(userId);
+}
 
-    const ws = connections.get(m);
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(
-        JSON.stringify({
-          type: "message",
-          vaultId,
-          blob,
-          from: senderId,
-          id: msgId,
-          ts
-        })
-      );
-      markMessageDelivered(msgId);
-    }
+function removeFromLiveVault(userId) {
+  for (const v of liveVaultMap.values()) {
+    v.delete(userId);
   }
 }
 
 // ============================================================
-// CONNECTION HANDLER
+// WEBSOCKET SERVER
 // ============================================================
+const wss = new WebSocket.Server({ port: 8080 }, () => {
+  console.log("WS Server running on port 8080");
+});
 
-wss.on("connection", ws => {
-  let currentUserId = null;
+// ============================================================
+// SEND TO MEMBER (if connected)
+// ============================================================
+function sendToUser(userId, packet) {
+  const sock = clients.get(userId);
+  if (sock && sock.readyState === WebSocket.OPEN) {
+    sock.send(JSON.stringify(packet));
+    return true;
+  }
+  return false;
+}
 
-  ws.on("message", data => {
+// ============================================================
+// BROADCAST WITHIN VAULT
+// ============================================================
+function broadcastToVault(vaultId, packet, exceptUser = null) {
+  const members = liveVaultMap.get(vaultId);
+  if (!members) return;
+
+  for (const uid of members) {
+    if (uid === exceptUser) continue;
+    sendToUser(uid, packet);
+  }
+}
+
+// ============================================================
+// STORE OFFLINE MESSAGE
+// ============================================================
+async function storeMessage(vaultId, fromUser, messageBlob) {
+  const id = uuidv4();
+  const timestamp = Date.now();
+
+  await dbRun(
+    `INSERT INTO messages (id, vaultId, fromUser, messageBlob, timestamp)
+     VALUES (?, ?, ?, ?, ?)`,
+    [
+      id,
+      vaultId,
+      fromUser,
+      JSON.stringify(messageBlob),
+      timestamp
+    ]
+  );
+}
+
+// ============================================================
+// DELIVER STORED MESSAGES ON LOGIN
+// ============================================================
+async function deliverOfflineMessages(userId, userVaults) {
+  const rows = await dbAll(
+    `SELECT * FROM messages WHERE vaultId IN (${userVaults.map(()=>"?").join(",")})
+     ORDER BY timestamp ASC`,
+    userVaults
+  );
+
+  for (const row of rows) {
+    const payload = {
+      type: "message",
+      vaultId: row.vaultId,
+      from: row.fromUser,
+      blob: JSON.parse(row.messageBlob),
+      ts: row.timestamp
+    };
+
+    sendToUser(userId, payload);
+  }
+}
+
+// ============================================================
+// HANDLE CLIENT CONNECTION
+// ============================================================
+wss.on("connection", (ws) => {
+
+  let userId = null;
+
+  ws.on("message", async (data) => {
     let msg;
-    try {
-      msg = JSON.parse(data.toString());
-    } catch (_) {
-      return;
-    }
+    try { msg = JSON.parse(data); }
+    catch { return; }
 
     switch (msg.type) {
 
-      // --------------------------------------------
-      // IDENTIFY USER
-      // --------------------------------------------
-      case "identify": {
-        currentUserId = msg.userHash;
-        addUserIfNotExists(currentUserId);
-        updateUserLastSeen(currentUserId);
-        connections.set(currentUserId, ws);
+      // --------------------------------------------------------
+      // IDENTIFY
+      // --------------------------------------------------------
+      case "identify":
+        userId = msg.userHash;
+        clients.set(userId, ws);
 
-        // Send offline messages
-        const undelivered = getUndeliveredMessagesForUser(currentUserId);
-        for (const m of undelivered) {
-          ws.send(
-            JSON.stringify({
-              type: "message",
-              vaultId: m.vault_id,
-              blob: JSON.parse(m.json),
-              from: m.sender_id,
-              id: m.id,
-              ts: m.ts
-            })
-          );
-          markMessageDelivered(m.id);
+        // Join vaults the client says they belong to
+        for (const v of msg.vaults) {
+          addToLiveVault(v, userId);
+          await dbRun(
+            `INSERT INTO vaultMembers (vaultId, userId) VALUES (?, ?)`,
+            [v, userId]
+          ).catch(()=>{});
         }
 
-        ws.send(JSON.stringify({ type: "identify-ack", userId: currentUserId }));
-        break;
-      }
+        // Deliver offline messages
+        await deliverOfflineMessages(userId, msg.vaults);
 
-      // --------------------------------------------
+        sendToUser(userId, { type: "identify-ack" });
+        break;
+
+
+      // --------------------------------------------------------
       // JOIN VAULT
-      // --------------------------------------------
-      case "join-vault": {
-        const { vaultId, isPrivate, userHash } = msg;
-        const type = isPrivate ? "private" : "public";
+      // --------------------------------------------------------
+      case "join-vault":
+        if (!userId) return;
 
-        addVaultIfNotExists(vaultId, type);
+        addToLiveVault(msg.vaultId, userId);
 
-        // Enforce private vault rules
-        if (type === "private") {
-          const count = getVaultMemberCount(vaultId);
-          if (count >= 2) {
-            ws.send(JSON.stringify({
-              type: "error",
-              message: "Private vault already has 2 members."
-            }));
-            return;
-          }
-        }
+        await dbRun(
+          `INSERT INTO vaultMembers (vaultId, userId) VALUES (?, ?)`,
+          [msg.vaultId, userId]
+        ).catch(()=>{});
 
-        addMemberToVault(vaultId, userHash);
-
-        ws.send(JSON.stringify({
-          type: "join-ack",
-          vaultId
-        }));
+        sendToUser(userId, { type: "join-ack", vaultId: msg.vaultId });
         break;
-      }
 
-      // --------------------------------------------
-      // LEAVE VAULT
-      // --------------------------------------------
-      case "leave-vault": {
-        const { vaultId, userHash } = msg;
-        removeMemberFromVault(vaultId, userHash);
-        ws.send(JSON.stringify({ type: "leave-ack", vaultId }));
+
+      // --------------------------------------------------------
+      // SEND MESSAGE
+      // --------------------------------------------------------
+      case "send":
+        if (!userId) return;
+
+        const packet = {
+          type: "message",
+          vaultId: msg.vaultId,
+          from: msg.from,
+          blob: msg.blob,
+          ts: msg.ts
+        };
+
+        // Store persistently
+        await storeMessage(msg.vaultId, msg.from, msg.blob);
+
+        // Broadcast to live members
+        broadcastToVault(msg.vaultId, packet, msg.from);
+
+        sendToUser(msg.from, { type: "send-ack", id: msg.id });
         break;
-      }
 
-      // --------------------------------------------
-      // RECEIVE ENCRYPTED MESSAGE (TEXT / FILE / CHUNKS)
-      // --------------------------------------------
-      case "send": {
-        const { vaultId, blob, from, ts } = msg;
-        deliverMessageToVaultMembers(from, vaultId, blob, ts);
-        ws.send(JSON.stringify({ type: "send-ack" }));
+
+      // --------------------------------------------------------
+      // NUKE ACCOUNT (delete all stored messages)
+      // --------------------------------------------------------
+      case "nuke":
+        if (!userId) return;
+        await dbRun(`DELETE FROM messages WHERE fromUser = ?`, [userId]);
         break;
-      }
 
-      // --------------------------------------------
-      // USER WIPES EVERYTHING
-      // --------------------------------------------
-      case "nuke": {
-        const userId = msg.userHash;
 
-        // Remove from all vaults
-        db.prepare("DELETE FROM vault_members WHERE user_id = ?")
-          .run(userId);
-
-        // Delete queued messages
-        db.prepare(`
-          UPDATE messages m
-          SET delivered = 1
-          WHERE m.id IN (
-            SELECT m.id
-            FROM messages m
-            JOIN vault_members v ON m.vault_id = v.vault_id
-            WHERE v.user_id = ?
-          )
-        `).run(userId);
-
-        ws.send(JSON.stringify({ type: "nuked" }));
-        break;
-      }
-
+      // --------------------------------------------------------
+      // KEEPALIVE
+      // --------------------------------------------------------
       case "ping":
-        ws.send(JSON.stringify({ type: "pong", ts: now() }));
+        sendToUser(userId, { type: "pong" });
         break;
     }
   });
 
+  // --------------------------------------------------------------
+  // ON CLOSE
+  // --------------------------------------------------------------
   ws.on("close", () => {
-    if (currentUserId) {
-      connections.delete(currentUserId);
-      updateUserLastSeen(currentUserId);
+    if (userId) {
+      clients.delete(userId);
+      removeFromLiveVault(userId);
     }
   });
-
-  ws.send(JSON.stringify({ type: "connected" }));
 });
 
-// ============================================================
-// START SERVER
-// ============================================================
-
-server.listen(PORT, () => {
-  console.log("Child server running on port", PORT);
-});
