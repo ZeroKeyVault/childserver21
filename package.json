@@ -1,15 +1,20 @@
 {
-  "name": "child-server",
-  "version": "1.0.0",
-  "description": "Child encrypted messaging relay server",
-  "main": "server.js",
+  "name": "child-secure-server",
+  "version": "2.0.0",
+  "description": "Secure persistent WebSocket relay for CHILD encrypted messaging app",
+  "main": "server2.js",
+  "type": "commonjs",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server2.js"
   },
   "dependencies": {
-    "ws": "^8.14.2"
+    "better-sqlite3": "^9.0.0",
+    "uuid": "^9.0.0",
+    "ws": "^8.15.1"
   },
   "engines": {
-    "node": ">=18.0.0"
-  }
+    "node": ">=18.x"
+  },
+  "author": "Prakhar Solanki",
+  "license": "MIT"
 }
