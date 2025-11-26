@@ -1,20 +1,18 @@
 {
   "name": "child-secure-server",
-  "version": "2.0.0",
-  "description": "Secure persistent WebSocket relay for CHILD encrypted messaging app",
+  "version": "2.0.1",
+  "description": "Secure persistent WebSocket relay with sqlite3",
   "main": "server2.js",
   "type": "commonjs",
   "scripts": {
     "start": "node server2.js"
   },
   "dependencies": {
-    "better-sqlite3": "^9.0.0",
+    "sqlite3": "^5.1.7",
     "uuid": "^9.0.0",
     "ws": "^8.15.1"
   },
   "engines": {
     "node": ">=18.x"
-  },
-  "author": "Prakhar Solanki",
-  "license": "MIT"
+  }
 }
